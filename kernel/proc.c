@@ -5,6 +5,7 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "pstat.h"
 
 struct cpu cpus[NCPU];
 
@@ -120,6 +121,7 @@ found:
   p->pid = allocpid();
   p->state = USED;
 
+  p->priority = 0;
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
     freeproc(p);
@@ -164,6 +166,8 @@ freeproc(struct proc *p)
   p->killed = 0;
   p->xstate = 0;
   p->state = UNUSED;
+  p->readytime = 0;
+  p->priority = 0;
 }
 
 // Create a user page table for a given process,
@@ -295,6 +299,8 @@ fork(void)
   // Cause fork to return 0 in the child.
   np->trapframe->a0 = 0;
 
+  np->priority = p->priority;
+  
   // increment reference counts on open file descriptors.
   for(i = 0; i < NOFILE; i++)
     if(p->ofile[i])
@@ -444,26 +450,46 @@ scheduler(void)
   for(;;){
     // Avoid deadlock by ensuring that devices can interrupt.
     intr_on();
-
-    for(p = proc; p < &proc[NPROC]; p++) {
-      acquire(&p->lock);
-      if(p->state == RUNNABLE) {
-        // Switch to chosen process.  It is the process's job
-        // to release its lock and then reacquire it
-        // before jumping back to us.
-        p->state = RUNNING;
-        c->proc = p;
-        swtch(&c->context, &p->context);
-
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
-        c->proc = 0;
+    if(SCHED_POLICY == ROUND_ROBIN_SCHED){
+      for(p = proc; p < &proc[NPROC]; p++){
+        acquire(&p->lock);
+        if(p->state == RUNNABLE) {
+          p->state = RUNNING;
+          c->proc = p;
+          swtch(&c->context, &p->context);
+          c->proc = 0;
       }
-      release(&p->lock);
+        release(&p->lock);
+      }
+  }
+    else if(SCHED_POLICY == PRIORITY_SCHED){
+      struct proc *highest = 0;
+      for(p = proc; p < &proc[NPROC]; p++){
+        acquire(&p->lock);
+        if(p->state == RUNNABLE){
+          if(highest == 0 || p->priority > highest->priority){
+            if(highest != 0){
+              release(&highest->lock);
+            }
+            highest = p;
+          } else {
+            release(&p->lock);
+          }
+        } else {
+          release(&p->lock);
+        }
+      }
+      if(highest){
+        highest->state = RUNNING;
+        c->proc = highest;
+
+        swtch(&c->context, &highest->context);
+        c->proc=0;
+        release(&highest->lock);
+      }
     }
   }
 }
-
 // Switch to scheduler.  Must hold only p->lock
 // and have changed proc->state. Saves and restores
 // intena because intena is a property of this
@@ -654,3 +680,35 @@ procdump(void)
     printf("\n");
   }
 }
+
+
+
+// Fill in user-provided array with info for current processes
+// Return the number of processes found
+int
+procinfo(uint64 addr)
+{
+  struct proc *p;
+  struct proc *thisproc = myproc();
+  struct pstat procinfo;
+  int nprocs = 0;
+  for(p = proc; p < &proc[NPROC]; p++){ 
+    if(p->state == UNUSED)
+      continue;
+    nprocs++;
+    procinfo.pid = p->pid;
+    procinfo.state = p->state;
+    procinfo.size = p->sz;
+    if (p->parent)
+      procinfo.ppid = (p->parent)->pid;
+    else
+      procinfo.ppid = 0;
+    for (int i=0; i<16; i++)
+      procinfo.name[i] = p->name[i];
+   if (copyout(thisproc->pagetable, addr, (char *)&procinfo, sizeof(procinfo)) < 0)
+      return -1;
+    addr += sizeof(procinfo);
+  }
+  return nprocs;
+}
+
