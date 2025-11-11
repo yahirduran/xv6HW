@@ -69,17 +69,17 @@ usertrap(void)
     // ok
   } else if(r_scause() == 13 || r_scause() == 15){
       //store page fault
-      uint64 va = r_stval();
-      if(va < p->sz){
-        uint64 a = PGROUNDDOWN(va);
+      uint64 virtaddr = r_stval();
+      if(virtaddr < p->sz){
+        uint64 addr = PGROUNDDOWN(virtaddr);
         char *mem = kalloc();
         //no memory left
         if(mem == 0){
-          printf("lazy alloc: OOM for va %p (pid=%d)\n", a, p->pid);
+          printf("lazy alloc: OOM for virtual address %p (pid=%d)\n", addr, p->pid);
           p->killed = 1;
         } else {
           memset(mem, 0, PGSIZE);
-          if(mappages(p->pagetable, a, PGSIZE, (uint64)mem, PTE_R|PTE_W|PTE_U) != 0){
+          if(mappages(p->pagetable, addr, PGSIZE, (uint64)mem, PTE_R|PTE_W|PTE_U) != 0){
             kfree(mem);     
             p->killed = 1;
         }
