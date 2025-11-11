@@ -41,27 +41,17 @@ sys_wait(void)
 uint64
 sys_sbrk(void)
 {
-  struct proc *addr = myproc();
+  int addr;
   int n;
 
   if(argint(0, &n) < 0)
     return -1;
-  
-  uint64 oldsize = addr->sz;
-  
-  if(n == 0)
-    return oldsize;
-  
-  if(n > 0){
-    addr->sz = oldsize + n;
-    return oldsize;
-  } else {
-      // deallocate memory and free frames to the new size
-      uint64 newsize = uvmdealloc(addr->pagetable, oldsize, oldsize+n);
-      addr->sz = newsize;
-      return oldsize;
-  }
+  addr = myproc()->sz;
+  if(growproc(n) < 0)
+    return -1;
+  return addr;
 }
+
 uint64
 sys_sleep(void)
 {
@@ -104,10 +94,4 @@ sys_uptime(void)
   xticks = ticks;
   release(&tickslock);
   return xticks;
-}
-
-uint64
-sys_freepmem(void)
-{
-  return freepmem();
 }
