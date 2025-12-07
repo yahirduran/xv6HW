@@ -23,6 +23,7 @@ int getpid(void);
 char* sbrk(int);
 int sleep(int);
 int uptime(void);
+uint64 freepmem (void);
 
 // ulib.c
 int stat(const char*, struct stat*);
@@ -40,3 +41,5 @@ void free(void*);
 int atoi(const char*);
 int memcmp(const void *, const void *, uint);
 void *memcpy(void *, const void *, uint);
+void *mmap(void *addr, uint length, int prot, int flags, int fd, int offset); // HOMEWORK 5, mmap and munmap
+int   munmap(void *addr, uint length);  // HOMEWORK 5, mmap and munmap

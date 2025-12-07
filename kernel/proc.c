@@ -5,6 +5,7 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "stat.h"
 
 struct cpu cpus[NCPU];
 
@@ -25,6 +26,11 @@ extern char trampoline[]; // trampoline.S
 // memory model when using p->parent.
 // must be acquired before any p->lock.
 struct spinlock wait_lock;
+
+// Homework 5: array of locks for mmr_list entries
+struct mmr_list mmr_list[NPROC*MAX_MMR];
+struct spinlock listid_lock;
+// END Homework 5: array of locks for mmr_list entries
 
 // Allocate a page for each process's kernel stack.
 // Map it high in memory, followed by an invalid
@@ -153,6 +159,44 @@ freeproc(struct proc *p)
   if(p->trapframe)
     kfree((void*)p->trapframe);
   p->trapframe = 0;
+    // --- BEGIN: mmap region cleanup ---
+  for (int i = 0; i < MAX_MMR; i++) {
+    int dofree = 0;
+
+    if (p->mmr[i].valid == 1) {
+      if (p->mmr[i].flags & MAP_PRIVATE) {
+        // private mmap: free the physical pages when unmapping
+        dofree = 1;
+      } else { // MAP_SHARED
+        // check if this is the last process sharing the region
+        struct mmr_list *lst = &mmr_list[p->mmr[i].mmr_family.listid];
+        acquire(&lst->lock);
+        if (p->mmr[i].mmr_family.next == &p->mmr[i].mmr_family) {
+          // no one else in the family: free frames and listid
+          dofree = 1;
+          release(&lst->lock);
+          dealloc_mmr_listid(p->mmr[i].mmr_family.listid);
+        } else {
+          // remove this proc from the family circular list
+          p->mmr[i].mmr_family.next->prev = p->mmr[i].mmr_family.prev;
+          p->mmr[i].mmr_family.prev->next = p->mmr[i].mmr_family.next;
+          release(&lst->lock);
+        }
+      }
+
+      // unmap all pages in this region for this process;
+      // free physical frames only if dofree == 1
+      for (uint64 addr = p->mmr[i].addr;
+           addr < p->mmr[i].addr + p->mmr[i].length;
+           addr += PGSIZE) {
+        if (walkaddr(p->pagetable, addr))
+          uvmunmap(p->pagetable, addr, 1, dofree);
+      }
+
+      p->mmr[i].valid = 0;  // mark region invalid for this process
+    }
+  }
+  // --- END: mmap region cleanup ---
   if(p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
   p->pagetable = 0;
@@ -243,6 +287,7 @@ userinit(void)
   p->cwd = namei("/");
 
   p->state = RUNNABLE;
+  p->cur_max = MAXVA - 2 * PGSIZE;; // initialize cur_max
 
   release(&p->lock);
 }
@@ -282,7 +327,7 @@ fork(void)
   }
 
   // Copy user memory from parent to child.
-  if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0){
+  if(uvmcopy(p->pagetable, np->pagetable, 0, p->sz) < 0){
     freeproc(np);
     release(&np->lock);
     return -1;
@@ -304,6 +349,71 @@ fork(void)
   safestrcpy(np->name, p->name, sizeof(p->name));
 
   pid = np->pid;
+  np->cur_max = p->cur_max;
+
+    // ----- BEGIN: copy mmr table from parent to child -----
+
+  // Copy parent's mmr[] array to child
+  memmove(np->mmr, p->mmr, sizeof(p->mmr));
+
+  // For each mapped region, handle PRIVATE vs SHARED
+  for (int i = 0; i < MAX_MMR; i++) {
+    if (!p->mmr[i].valid)
+      continue;
+
+    // PRIVATE region: allocate new pages and copy contents
+    if (p->mmr[i].flags & MAP_PRIVATE) {
+      for (uint64 addr = p->mmr[i].addr;
+           addr < p->mmr[i].addr + p->mmr[i].length;
+           addr += PGSIZE) {
+        if (walkaddr(p->pagetable, addr)) {
+          if (uvmcopy(p->pagetable, np->pagetable, addr, addr + PGSIZE) < 0) {
+            freeproc(np);
+            release(&np->lock);
+            return -1;
+          }
+        }
+      }
+
+      // Initialize child's mmr_family for PRIVATE
+      np->mmr[i].mmr_family.proc   = np;
+      np->mmr[i].mmr_family.listid = -1;
+      np->mmr[i].mmr_family.next   = &np->mmr[i].mmr_family;
+      np->mmr[i].mmr_family.prev   = &np->mmr[i].mmr_family;
+
+    } else {
+      // SHARED region: share the same physical frames
+      for (uint64 addr = p->mmr[i].addr;
+           addr < p->mmr[i].addr + p->mmr[i].length;
+           addr += PGSIZE) {
+        if (walkaddr(p->pagetable, addr)) {
+          if (uvmcopyshared(p->pagetable, np->pagetable, addr, addr + PGSIZE) < 0) {
+            freeproc(np);
+            release(&np->lock);
+            return -1;
+          }
+        }
+      }
+
+      // Hook child into the shared mmr family list
+      np->mmr[i].mmr_family.proc   = np;
+      np->mmr[i].mmr_family.listid = p->mmr[i].mmr_family.listid;
+
+      struct mmr_list *lst = &mmr_list[np->mmr[i].mmr_family.listid];
+      acquire(&lst->lock);
+
+      // Insert child right after parent in the circular doubly-linked list
+      np->mmr[i].mmr_family.next = p->mmr[i].mmr_family.next;
+      np->mmr[i].mmr_family.prev = &p->mmr[i].mmr_family;
+      p->mmr[i].mmr_family.next->prev = &np->mmr[i].mmr_family;
+      p->mmr[i].mmr_family.next       = &np->mmr[i].mmr_family;
+
+      release(&lst->lock);
+    }
+  }
+
+  // ----- END: copy mmr table from parent to child -----
+
 
   release(&np->lock);
 
@@ -654,3 +764,54 @@ procdump(void)
     printf("\n");
   }
 }
+
+// HOMEWORK 5, mmap and munmap
+void
+mmrlistinit(void)
+{
+  struct mmr_list *pmmrlist;
+  initlock(&listid_lock,"listid");
+  for (pmmrlist = mmr_list; pmmrlist < &mmr_list[NPROC*MAX_MMR]; pmmrlist++) {
+    initlock(&pmmrlist->lock, "mmrlist");
+    pmmrlist->valid = 0;
+  }
+}
+
+// find the mmr_list for a given listid
+struct mmr_list*
+get_mmr_list(int listid) {
+  acquire(&listid_lock);
+  if (listid >=0 && listid < NPROC*MAX_MMR && mmr_list[listid].valid) {
+    release(&listid_lock);
+    return(&mmr_list[listid]);
+  }
+  else {
+    release(&listid_lock);
+    return 0;
+  }
+}
+
+// free up entry in mmr_list array
+void
+dealloc_mmr_listid(int listid) {
+  acquire(&listid_lock);
+  mmr_list[listid].valid = 0;
+  release(&listid_lock);
+}
+
+// find an unused entry in the mmr_list array
+int
+alloc_mmr_listid() {
+  acquire(&listid_lock);
+  int listid = -1;
+  for (int i = 0; i < NPROC*MAX_MMR; i++) {
+    if (mmr_list[i].valid == 0) {
+      mmr_list[i].valid = 1;
+      listid = i;
+      break;
+    }
+  }
+  release(&listid_lock);
+  return(listid);
+}
+// end of HOMEWORK 5, mmap and munmap

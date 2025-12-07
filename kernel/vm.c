@@ -173,9 +173,20 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
 
   for(a = va; a < va + npages*PGSIZE; a += PGSIZE){
     if((pte = walk(pagetable, a, 0)) == 0)
-      panic("uvmunmap: walk");
+    {
+      //panic("uvmunmap: walk");
+      // Before: panic("uvmunmap: walk"); because PTE may not exist for all pages in lazy allocation.
+      //after: skip silently.
+      continue;
+    }
     if((*pte & PTE_V) == 0)
-      panic("uvmunmap: not mapped");
+    {
+      //panic("uvmunmap: not mapped");
+      // Before: panic("uvmunmap: not mapped");
+      // After: skip silently.
+      continue;
+    }
+      
     if(PTE_FLAGS(*pte) == PTE_V)
       panic("uvmunmap: not a leaf");
     if(do_free){
@@ -297,35 +308,67 @@ uvmfree(pagetable_t pagetable, uint64 sz)
 // physical memory.
 // returns 0 on success, -1 on failure.
 // frees any allocated pages on failure.
+
+// Copy pages from "old" into "new" in the virtual address range [start, end).
+// Each page gets its own new physical frame (no sharing).
 int
-uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+uvmcopy(pagetable_t old, pagetable_t new, uint64 start, uint64 end)
 {
   pte_t *pte;
   uint64 pa, i;
   uint flags;
   char *mem;
 
-  for(i = 0; i < sz; i += PGSIZE){
-    if((pte = walk(old, i, 0)) == 0)
+  for (i = start; i < end; i += PGSIZE) {
+    if ((pte = walk(old, i, 0)) == 0)
       panic("uvmcopy: pte should exist");
-    if((*pte & PTE_V) == 0)
+    if ((*pte & PTE_V) == 0)
       panic("uvmcopy: page not present");
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
+    if ((mem = kalloc()) == 0)
       goto err;
     memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
+    if (mappages(new, i, PGSIZE, (uint64)mem, flags) != 0) {
       kfree(mem);
       goto err;
     }
   }
   return 0;
 
- err:
-  uvmunmap(new, 0, i / PGSIZE, 1);
+err:
+  // unmap whatever we already mapped into "new"
+  uvmunmap(new, start, (i - start) / PGSIZE, 1);
   return -1;
 }
+
+// Copy *mappings* from "old" into "new" in [start, end),
+// but share the same physical pages (no new kalloc, no memmove).
+int
+uvmcopyshared(pagetable_t old, pagetable_t new, uint64 start, uint64 end)
+{
+  pte_t *pte;
+  uint64 pa, i;
+  uint flags;
+
+  for (i = start; i < end; i += PGSIZE) {
+    if ((pte = walk(old, i, 0)) == 0)
+      panic("uvmcopyshared: pte should exist");
+    if ((*pte & PTE_V) == 0)
+      panic("uvmcopyshared: page not present");
+    pa = PTE2PA(*pte);
+    flags = PTE_FLAGS(*pte);
+    if (mappages(new, i, PGSIZE, pa, flags) != 0) {
+      goto err;
+    }
+  }
+  return 0;
+
+err:
+  uvmunmap(new, start, (i - start) / PGSIZE, 1);
+  return -1;
+}
+
 
 // mark a PTE invalid for user access.
 // used by exec for the user stack guard page.
@@ -432,3 +475,29 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
     return -1;
   }
 }
+
+//HW5 mmap and munmap
+// Allocate PTE pages if needed but leave PTE_V bits clear.
+int
+mapvpages(pagetable_t pagetable, uint64 va, uint64 size)
+{
+  uint64 a, last;
+  pte_t *pte;
+
+  if (size == 0)
+    panic("mappages: size");
+
+  a = PGROUNDDOWN(va);
+  last = PGROUNDDOWN(va + size - 1);
+  for (;;) {
+    if ((pte = walk(pagetable, a, 1)) == 0)
+      return -1;
+    if (*pte & PTE_V)
+      panic("mappages: remap");
+    if (a == last)
+      break;
+    a += PGSIZE;
+  }
+  return 0;
+}
+//end HW5 mmap and munmap
